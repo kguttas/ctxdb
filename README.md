@@ -168,7 +168,48 @@ The limit is 100 requests per minute per token. Exceeding it returns HTTP 429.
 | `CTXDB_PATH` | Path to the `.db` file | `~/.ctxdb/context.db` |
 | `CTXDB_COLLECTION` | Default collection for tool calls | `default` |
 | `CTXDB_EMBED` | Embedding spec for the default collection | `none` |
+| `CTXDB_CLIENT` | Name recorded on everything this agent writes | `unknown` |
+| `CTXDB_BUSY_TIMEOUT` | Milliseconds a writer waits for the lock | `20000` |
 | `VOYAGE_API_KEY` | Only if a collection uses `voyage:...` | — |
+
+### Several agents on one database
+
+One `.db` file serves more than one coding agent at a time — Claude Code, Cocos,
+whatever comes next. Point them all at the same `CTXDB_PATH` and give each one a
+name:
+
+```jsonc
+// Claude Code
+{ "command": "uv", "args": ["--directory", "/path/to/ctxdb", "run", "ctxdb-mcp"],
+  "env": { "CTXDB_CLIENT": "claude" } }
+```
+
+```toml
+# Cocos
+[mcp.servers.ctxdb]
+command = "uv"
+args = ["--directory", "/path/to/ctxdb", "run", "ctxdb-mcp"]
+env = { CTXDB_PATH = "~/.ctxdb/context.db", CTXDB_CLIENT = "cocos" }
+```
+
+What one stores, the others find. Every item records who wrote it, so a wrong
+answer can be traced back to the session that planted it:
+
+```sql
+SELECT client, COUNT(*) FROM items GROUP BY client;
+```
+
+**Why it holds up.** SQLite admits one writer at a time, so what decides whether
+this works is not the number of agents but how long each one holds the lock. WAL
+lets readers carry on regardless; the writer's share is kept to the inserts alone,
+with embeddings computed *before* the transaction opens. Ingesting a manual with a
+slow model therefore blocks nobody — measured in `tests/test_concurrent.py`, where a
+second agent writes straight through an eight-second ingest without losing a single
+write. Before that split it lost all twelve.
+
+If your machine is slow enough to still hit contention, raise `CTXDB_BUSY_TIMEOUT`:
+waiting is the correct behaviour, since the alternative is not more concurrency but
+a lost write.
 
 ### Choosing an embedding engine
 
@@ -225,8 +266,9 @@ ctxdb status
 No network, no models, no fixtures to download:
 
 ```bash
-python tests/test_ctxdb.py    # engine: chunking, supersession, budget, graph
-python tests/test_vector.py   # vector plumbing, via a toy embedder
+python tests/test_ctxdb.py       # engine: chunking, supersession, budget, graph
+python tests/test_vector.py      # vector plumbing, via a toy embedder
+python tests/test_concurrent.py  # two agents writing at once, and the migration
 ```
 
 ## Project layout
@@ -234,7 +276,7 @@ python tests/test_vector.py   # vector plumbing, via a toy embedder
 ```
 ctxdb/
   schema.py      SQL schema, and why each table exists
-  db.py          Connection, sqlite-vec loading, per-dimension vector tables
+  db.py          Connection, migrations, sqlite-vec, and the concurrency settings
   chunking.py    Heading-, code- and paragraph-aware splitting
   embeddings.py  Swappable providers (none / local / voyage)
   store.py       Writes: documents, facts, entities, relations
@@ -251,8 +293,8 @@ ctxdb/
   well into the tens of thousands of chunks.
 - `context_search` does not rewrite the query. For very indirect questions, run
   two searches with different phrasings.
-- Single-writer, like SQLite itself. Fine for one user and one agent; not built
-  for a multi-tenant write load.
+- Single-writer, like SQLite itself. Several agents share one file comfortably
+  (see below), but this is not built for a multi-tenant *server* write load.
 
 ## License
 

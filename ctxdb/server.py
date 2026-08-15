@@ -1,14 +1,21 @@
-"""MCP server: exposes the context store as tools for Claude.
+"""MCP server: exposes the context store as tools for a coding agent.
 
 Setup (Claude Code):
 
-    claude mcp add ctxdb -- uv --directory /path/to/ctxdb run ctxdb-mcp
+    claude mcp add ctxdb -e CTXDB_CLIENT=claude -- uv --directory /path/to/ctxdb run ctxdb-mcp
+
+Any MCP client works the same way — Cocos and the rest speak the same protocol. Point
+them all at one `CTXDB_PATH` and they share memory; give each a different `CTXDB_CLIENT`
+and you can still tell who wrote what. Writing at the same time is fine: see
+`store.embed_ahead` for what makes that hold.
 
 Environment variables:
-    CTXDB_PATH        path to the .db file (default ~/.ctxdb/context.db)
-    CTXDB_COLLECTION  default collection when a tool call omits one
-    CTXDB_EMBED       embedding spec for the default collection
-    VOYAGE_API_KEY    only if some collection uses embed_spec='voyage:...'
+    CTXDB_PATH          path to the .db file (default ~/.ctxdb/context.db)
+    CTXDB_COLLECTION    default collection when a tool call omits one
+    CTXDB_EMBED         embedding spec for the default collection
+    CTXDB_CLIENT        name recorded on everything this agent writes
+    CTXDB_BUSY_TIMEOUT  milliseconds a writer waits for the lock (default 20000)
+    VOYAGE_API_KEY      only if some collection uses embed_spec='voyage:...'
 """
 
 from __future__ import annotations

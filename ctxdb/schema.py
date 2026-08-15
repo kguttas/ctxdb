@@ -16,9 +16,17 @@ Retrieval runs two indexes over those same `items`:
   vec_items_<dim>  -> sqlite-vec, for semantic similarity.
 Vector tables are created per dimension because each collection may use a
 different embedding model (384-dim local, 1024-dim Voyage, and so on).
+
+Every item also records the `client` that wrote it. One database is shared by
+several coding agents at once, and once that is true "who stored this" stops being
+trivia: it is how a wrong answer gets traced back to the session that planted it.
+
+Changing this file means bumping SCHEMA_VERSION and teaching `db._migrate` how to
+bring an older database forward. A new column here only ever reaches a fresh file:
+`CREATE TABLE IF NOT EXISTS` does nothing to one that already exists.
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -69,6 +77,7 @@ CREATE TABLE IF NOT EXISTS items (
     valid_until    TEXT,                 -- NULL = still current
     superseded_by  INTEGER REFERENCES items(id) ON DELETE SET NULL,
     embed_model    TEXT,                 -- NULL = no vector indexed
+    client         TEXT,                 -- which agent wrote it: 'claude', 'cocos', ...
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );

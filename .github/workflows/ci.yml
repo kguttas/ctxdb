@@ -29,3 +29,8 @@ jobs:
 
       - name: Vector branch tests
         run: python tests/test_vector.py
+
+      # Spawns real processes writing to one file, so it is the only suite that can
+      # catch a regression in how long the write lock is held.
+      - name: Concurrency tests
+        run: python tests/test_concurrent.py

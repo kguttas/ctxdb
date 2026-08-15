@@ -8,6 +8,10 @@ Minimal usage:
     get_or_create_collection(conn, "project", embed_spec="local:intfloat/multilingual-e5-small")
     add_document(conn, "project", open("manual.md").read(), uri="manual.md")
     print(render_context(search(conn, "project", "how do I void an invoice", budget_tokens=1200)))
+
+Several processes may share one file — that is how more than one coding agent uses the
+same memory. Give each its own `connect()`; do not pass a connection between processes.
+Set `CTXDB_CLIENT` so what each writes can be told apart later.
 """
 
 from .chunking import chunk_text

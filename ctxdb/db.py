@@ -12,6 +12,22 @@ from .schema import DDL, SCHEMA_VERSION, VEC_TABLE_DDL
 
 DEFAULT_DB_PATH = Path(os.environ.get("CTXDB_PATH", Path.home() / ".ctxdb" / "context.db"))
 
+# How long a writer waits for the lock before giving up, in milliseconds.
+#
+# Python's sqlite3 defaults to 5 s, which is fine for one process and thin for
+# several: with two agents working at once, an ingest that takes longer than that
+# makes every other write fail outright rather than queue behind it. SQLite only
+# ever admits one writer, so waiting is the correct behaviour — the alternative is
+# not more concurrency, it is a lost write.
+DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("CTXDB_BUSY_TIMEOUT", "20000"))
+
+# Which agent is writing. Recorded on everything it stores.
+#
+# One database serves several coding agents at once — Claude Code, Cocos, whatever
+# comes next — and once they share it, "who wrote this" stops being a curiosity: it
+# is how you audit a wrong answer back to the session that planted it.
+CLIENT = os.environ.get("CTXDB_CLIENT", "unknown")
+
 
 def now() -> str:
     """ISO-8601 UTC timestamp. Everything in the database uses this format."""
@@ -43,19 +59,55 @@ def connect(path: str | Path | None = None) -> Connection:
 
     # check_same_thread=False because the MCP server runs tools in a thread pool;
     # access is serialized with a lock in server.py.
-    conn = sqlite3.connect(str(db_path), check_same_thread=False, factory=Connection)
+    conn = sqlite3.connect(
+        str(db_path),
+        check_same_thread=False,
+        factory=Connection,
+        timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
+    )
     conn.row_factory = sqlite3.Row
+
+    # WAL already lets readers work while one writer holds the lock; NORMAL is its
+    # matching durability setting. Under WAL a crash can only lose the last commits,
+    # never corrupt the file, and in exchange every write stops waiting on an fsync —
+    # which is time the lock is not held, and therefore time other agents are not
+    # blocked. FULL buys durability that matters for a ledger, not for a cache of
+    # context that can be re-ingested.
+    conn.execute("PRAGMA synchronous=NORMAL")
 
     conn.vec_available = _load_sqlite_vec(conn)
     conn.executescript(DDL)
+    _migrate(conn)
 
-    version = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-    if version is None:
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
-        )
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(SCHEMA_VERSION),),
+    )
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an older database up to the current schema.
+
+    `CREATE TABLE IF NOT EXISTS` in the DDL only ever helps a fresh file: a database
+    created before a column existed keeps its old shape forever, and the first insert
+    naming that column fails. Columns are added one by one because SQLite's `ADD COLUMN`
+    is instant and non-destructive, which makes this safe to run on every open.
+
+    Indexes over a migrated column belong **here and not in the DDL**, and that is not a
+    matter of taste: the DDL runs first, so an index declared there would be created over
+    a column the old database has not got yet, and opening it would fail outright. Every
+    existing database would break on upgrade.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(items)")}
+    if "client" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN client TEXT")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_items_client ON items(collection_id, client)"
+    )
 
 
 def _load_sqlite_vec(conn: sqlite3.Connection) -> bool:

@@ -6,10 +6,10 @@ import hashlib
 import json
 import re
 import sqlite3
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 from .chunking import chunk_text
-from .db import ensure_vec_table, estimate_tokens, normalize, now
+from .db import CLIENT, ensure_vec_table, estimate_tokens, normalize, now
 from .embeddings import get_embedder
 
 
@@ -73,29 +73,54 @@ def list_collections(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 
 
-def _index_vectors(
-    conn: sqlite3.Connection, collection: sqlite3.Row, item_ids: list[int], texts: list[str]
+class Embedded(NamedTuple):
+    """Vectors already computed, waiting to be written."""
+
+    spec: str
+    dim: int
+    vectors: list[list[float]]
+
+
+def embed_ahead(collection: sqlite3.Row, texts: list[str]) -> Embedded | None:
+    """Compute the vectors *before* opening the write transaction.
+
+    This split is what makes several agents able to work at once. SQLite admits one
+    writer at a time, so the only thing that matters for concurrency is how long that
+    writer holds the lock. Embedding inside the transaction held it for as long as the
+    model took — or, with a hosted provider, for a network round trip — and every other
+    agent's write failed once that went past the busy timeout. Measured: with the lock
+    held eight seconds, a second agent lost twelve writes out of twelve.
+
+    Computing first costs nothing when the work turns out to be unnecessary (the caller
+    checks for "unchanged" before asking), and moves the slow part to where it belongs:
+    outside the lock.
+    """
+    if not texts or collection["embed_dim"] <= 0:
+        return None
+
+    embedder = get_embedder(collection["embed_spec"])
+    vectors = embedder.embed(texts, mode="document")
+    return Embedded(embedder.spec, embedder.dim, vectors)
+
+
+def _store_vectors(
+    conn: sqlite3.Connection, item_ids: list[int], embedded: Embedded | None
 ) -> None:
-    """Compute and insert vectors for a batch of items."""
-    if not item_ids or collection["embed_dim"] <= 0:
+    """Write vectors that are already computed. No model, no network, no waiting."""
+    if embedded is None or not item_ids:
         return
 
     import sqlite_vec
 
-    embedder = get_embedder(collection["embed_spec"])
-    table = ensure_vec_table(conn, embedder.dim)
-    vectors = embedder.embed(texts, mode="document")
-
-    conn.executemany(
-        f"DELETE FROM {table} WHERE rowid = ?", [(i,) for i in item_ids]
-    )
+    table = ensure_vec_table(conn, embedded.dim)
+    conn.executemany(f"DELETE FROM {table} WHERE rowid = ?", [(i,) for i in item_ids])
     conn.executemany(
         f"INSERT INTO {table} (rowid, embedding) VALUES (?, ?)",
-        [(i, sqlite_vec.serialize_float32(v)) for i, v in zip(item_ids, vectors)],
+        [(i, sqlite_vec.serialize_float32(v)) for i, v in zip(item_ids, embedded.vectors)],
     )
     conn.executemany(
         "UPDATE items SET embed_model = ? WHERE id = ?",
-        [(embedder.spec, i) for i in item_ids],
+        [(embedded.spec, i) for i in item_ids],
     )
 
 
@@ -151,9 +176,18 @@ def add_document(
         ).fetchone()["n"]
         return {"source_id": existing["id"], "chunks": n, "status": "unchanged"}
 
+    if existing and not replace:
+        raise ValueError(f"a document with uri={uri!r} already exists (pass replace=True)")
+
+    # Chunking and embedding happen before anything is written, so the lock is held
+    # only for the inserts. See `embed_ahead`: this is what lets a second agent keep
+    # working while this one ingests a manual.
+    chunks = chunk_text(text, target_tokens=target_tokens)
+    embedded = embed_ahead(
+        collection, [f"{c.heading_path}\n{c.text}".strip() for c in chunks]
+    )
+
     if existing:
-        if not replace:
-            raise ValueError(f"a document with uri={uri!r} already exists (pass replace=True)")
         delete_source(conn, collection_name, uri=uri)
 
     cur = conn.execute(
@@ -163,7 +197,6 @@ def add_document(
     )
     source_id = int(cur.lastrowid)
 
-    chunks = chunk_text(text, target_tokens=target_tokens)
     item_ids: list[int] = []
     for chunk in chunks:
         # A chunk is indexed together with its heading path, so a query about
@@ -177,8 +210,8 @@ def add_document(
 
         cur = conn.execute(
             "INSERT INTO items (collection_id, kind, text, title, source_id, ord, meta,"
-            " token_estimate, created_at, updated_at)"
-            " VALUES (?, 'chunk', ?, ?, ?, ?, ?, ?, ?, ?)",
+            " token_estimate, client, created_at, updated_at)"
+            " VALUES (?, 'chunk', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 collection["id"],
                 chunk.text,
@@ -187,18 +220,14 @@ def add_document(
                 chunk.ord,
                 json.dumps(meta or {}),
                 estimate_tokens(chunk.text),
+                CLIENT,
                 stamp,
                 stamp,
             ),
         )
         item_ids.append(int(cur.lastrowid))
 
-    _index_vectors(
-        conn,
-        collection,
-        item_ids,
-        [f"{c.heading_path}\n{c.text}".strip() for c in chunks],
-    )
+    _store_vectors(conn, item_ids, embedded)
 
     for item_id in item_ids:
         _attach_entities(conn, collection, item_id, entities)
@@ -259,19 +288,23 @@ def set_fact(
         ).fetchone()
         if previous and previous["text"].strip() == statement.strip():
             return {"item_id": previous["id"], "status": "unchanged"}
-        if previous:
-            # Free the live-fact unique index by pointing the old row at itself;
-            # below it is corrected to the real replacement id.
-            conn.execute(
-                "UPDATE items SET superseded_by = id, valid_until = ?, updated_at = ?"
-                " WHERE id = ?",
-                (stamp, stamp, previous["id"]),
-            )
+
+    # After ruling out the unchanged case, and before writing anything.
+    embedded = embed_ahead(collection, [f"{subject or ''} {statement}".strip()])
+
+    if previous:
+        # Free the live-fact unique index by pointing the old row at itself;
+        # below it is corrected to the real replacement id.
+        conn.execute(
+            "UPDATE items SET superseded_by = id, valid_until = ?, updated_at = ?"
+            " WHERE id = ?",
+            (stamp, stamp, previous["id"]),
+        )
 
     cur = conn.execute(
         "INSERT INTO items (collection_id, kind, text, title, meta, confidence,"
-        " token_estimate, fact_key, valid_from, created_at, updated_at)"
-        " VALUES (?, 'fact', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " token_estimate, fact_key, valid_from, client, created_at, updated_at)"
+        " VALUES (?, 'fact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             collection["id"],
             statement,
@@ -281,6 +314,7 @@ def set_fact(
             estimate_tokens(statement),
             key,
             valid_from or stamp,
+            CLIENT,
             stamp,
             stamp,
         ),
@@ -291,7 +325,7 @@ def set_fact(
         conn.execute("UPDATE items SET superseded_by = ? WHERE id = ?", (item_id, previous["id"]))
         _drop_vectors(conn, collection["embed_dim"], [previous["id"]])
 
-    _index_vectors(conn, collection, [item_id], [f"{subject or ''} {statement}".strip()])
+    _store_vectors(conn, [item_id], embedded)
     _attach_entities(conn, collection, item_id, entities)
     if subject:
         _attach_entities(conn, collection, item_id, [subject])
@@ -317,15 +351,18 @@ def add_note(
     collection = require_collection(conn, collection_name)
     stamp = now()
     pieces = chunk_text(text) if estimate_tokens(text) > 600 else None
+    bodies = [c.text for c in pieces] if pieces else [text]
+
+    # Before the first insert, so the lock is not held while the model runs.
+    embedded = embed_ahead(collection, [f"{title or ''}\n{b}".strip() for b in bodies])
 
     item_ids: list[int] = []
-    texts: list[str] = []
     for chunk in pieces or [None]:
         body = chunk.text if chunk else text
         cur = conn.execute(
             "INSERT INTO items (collection_id, kind, text, title, ord, meta,"
-            " token_estimate, created_at, updated_at)"
-            " VALUES (?, 'note', ?, ?, ?, ?, ?, ?, ?)",
+            " token_estimate, client, created_at, updated_at)"
+            " VALUES (?, 'note', ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 collection["id"],
                 body,
@@ -333,14 +370,14 @@ def add_note(
                 chunk.ord if chunk else 0,
                 json.dumps(meta or {}),
                 estimate_tokens(body),
+                CLIENT,
                 stamp,
                 stamp,
             ),
         )
         item_ids.append(int(cur.lastrowid))
-        texts.append(f"{title or ''}\n{body}".strip())
 
-    _index_vectors(conn, collection, item_ids, texts)
+    _store_vectors(conn, item_ids, embedded)
     for item_id in item_ids:
         _attach_entities(conn, collection, item_id, entities)
         autolink_entities(conn, collection, item_id)
