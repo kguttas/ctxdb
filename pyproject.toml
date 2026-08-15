@@ -1,0 +1,40 @@
+[project]
+name = "ctxdb"
+version = "0.1.0"
+description = "A context database for LLMs: structure, store and retrieve the chunks that matter"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Mauricio Estrada Celis" }]
+keywords = ["llm", "rag", "mcp", "claude", "memory", "sqlite", "retrieval", "embeddings"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "sqlite-vec>=0.1.6",
+    "mcp>=1.2.0",
+]
+
+[project.optional-dependencies]
+local = ["sentence-transformers>=3.0"]
+voyage = ["voyageai>=0.3.0"]
+
+[project.urls]
+Homepage = "https://github.com/mauricioestradacelis/ctxdb"
+Issues = "https://github.com/mauricioestradacelis/ctxdb/issues"
+
+[project.scripts]
+ctxdb = "ctxdb.cli:main"
+ctxdb-mcp = "ctxdb.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ctxdb"]
