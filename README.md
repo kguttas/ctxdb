@@ -1,5 +1,9 @@
 # ctxdb
 
+[![tests](https://github.com/kguttas/ctxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/kguttas/ctxdb/actions/workflows/ci.yml)
+[![python](https://img.shields.io/badge/python-3.10%20%7C%203.12%20%7C%203.13-blue)](https://github.com/kguttas/ctxdb)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 **A context database for LLMs.** Store context as *structure*, retrieve only the
 pieces that matter for the question at hand.
 
