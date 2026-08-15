@@ -27,7 +27,7 @@ a single `.db` file, and plugs into Claude as an MCP server.
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/ctxdb.git && cd ctxdb
+git clone https://github.com/kguttas/ctxdb.git && cd ctxdb
 uv venv --python 3.12
 uv pip install -e .
 ```

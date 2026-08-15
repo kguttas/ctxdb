@@ -25,8 +25,8 @@ local = ["sentence-transformers>=3.0"]
 voyage = ["voyageai>=0.3.0"]
 
 [project.urls]
-Homepage = "https://github.com/mauricioestradacelis/ctxdb"
-Issues = "https://github.com/mauricioestradacelis/ctxdb/issues"
+Homepage = "https://github.com/kguttas/ctxdb"
+Issues = "https://github.com/kguttas/ctxdb/issues"
 
 [project.scripts]
 ctxdb = "ctxdb.cli:main"
