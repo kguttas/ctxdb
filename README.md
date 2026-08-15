@@ -10,7 +10,8 @@ pieces that matter for the question at hand.
 Not a text dump: ctxdb splits context into layers with different semantics and
 different expiry rules, then retrieves across them with a search that combines
 the lexical and the semantic. It runs on Python + SQLite (FTS5 + sqlite-vec) in
-a single `.db` file, and plugs into Claude as an MCP server.
+a single `.db` file, and plugs into any MCP client — Claude Code, Claude Desktop,
+Cocos — several of them sharing that one file at the same time.
 
 ```
                   ┌──────────── your query ────────────┐
@@ -39,8 +40,11 @@ uv pip install -e .
 Connect it to Claude Code:
 
 ```bash
-claude mcp add ctxdb -- uv --directory /absolute/path/to/ctxdb run ctxdb-mcp
+claude mcp add ctxdb -e CTXDB_CLIENT=claude -- uv --directory /absolute/path/to/ctxdb run ctxdb-mcp
 ```
+
+`CTXDB_CLIENT` is what stamps every item with the agent that wrote it; it costs
+nothing now and is the only thing that tells sessions apart later.
 
 That's it. Claude now has nine tools; ask it to remember something and then ask
 about it in a later session. No server to run, no Docker, no API key — the
@@ -56,7 +60,10 @@ surprisingly far.
     "ctxdb": {
       "command": "uv",
       "args": ["--directory", "/absolute/path/to/ctxdb", "run", "ctxdb-mcp"],
-      "env": { "CTXDB_PATH": "/absolute/path/to/context.db" }
+      "env": {
+        "CTXDB_PATH": "/absolute/path/to/context.db",
+        "CTXDB_CLIENT": "claude-desktop"
+      }
     }
   }
 }
@@ -259,7 +266,13 @@ ctxdb relate project "Batch" issued_by "Tax Authority"
 ctxdb search project "which search engine do we use" --neighbors 1
 ctxdb entity project "Tax Authority"
 ctxdb status
+ctxdb serve                    # the MCP server over stdio, same as ctxdb-mcp
 ```
+
+`--db /path/to/other.db` before the subcommand works on a file other than
+`CTXDB_PATH`; `search` also takes `-k`, `--tokens`, `--kinds`, `--entities` and
+`--json` for the raw hits instead of the rendered block. The CLI opens the same
+file an agent may have open — it queues behind the writer like any other client.
 
 ## Tests
 
@@ -270,6 +283,8 @@ python tests/test_ctxdb.py       # engine: chunking, supersession, budget, graph
 python tests/test_vector.py      # vector plumbing, via a toy embedder
 python tests/test_concurrent.py  # two agents writing at once, and the migration
 ```
+
+CI runs the three suites on Linux and Windows against Python 3.10, 3.12 and 3.13.
 
 ## Project layout
 
@@ -283,7 +298,18 @@ ctxdb/
   retrieve.py    BM25 + vectors, RRF fusion, token-budget packing
   server.py      MCP server
   cli.py         Terminal interface
+tests/
+  test_ctxdb.py       Engine
+  test_vector.py      Vector branch
+  test_concurrent.py  Two processes on one file, and the migration
 ```
+
+### Schema and upgrades
+
+The schema is at **version 2**; the `client` column arrived with it. Upgrading is
+just pulling the new code: `db._migrate` runs on every open, adds what is missing
+and is a no-op once the file is current. Nothing to export, nothing to reindex —
+existing items simply carry a `NULL` client, since nobody recorded one at the time.
 
 ## Known limits
 
@@ -294,7 +320,8 @@ ctxdb/
 - `context_search` does not rewrite the query. For very indirect questions, run
   two searches with different phrasings.
 - Single-writer, like SQLite itself. Several agents share one file comfortably
-  (see below), but this is not built for a multi-tenant *server* write load.
+  ([above](#several-agents-on-one-database)), but this is not built for a
+  multi-tenant *server* write load.
 
 ## License
 
