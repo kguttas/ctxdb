@@ -21,11 +21,31 @@ from .policy import MEMORY_POLICY
 ALIAS = {"local": f"local:{DEFAULT_LOCAL_MODEL}", "voyage": f"voyage:{DEFAULT_VOYAGE_MODEL}"}
 
 
+def _force_utf8_output() -> None:
+    """Write UTF-8 regardless of what the console would have chosen.
+
+    On Windows, stdout defaults to the ANSI codepage, so `print` encoded an
+    accented character as a single cp1252 byte: "configuración" left here as
+    bytes that are not valid UTF-8 at all. The SessionStart hook reads this
+    output and hands it to the model, so every Spanish memory arrived corrupted
+    — and silently, because nothing in the pipeline validates an encoding.
+
+    `errors="replace"` on top: a character with no representation should cost one
+    glyph, not the whole block. A hook that crashes mid-write injects nothing,
+    and nothing is how this system fails invisibly.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def _out(value) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_output()
     parser = argparse.ArgumentParser(prog="ctxdb", description=__doc__)
     parser.add_argument("--db", help="path to the .db file")
     sub = parser.add_subparsers(dest="cmd", required=True)

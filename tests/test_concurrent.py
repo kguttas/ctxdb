@@ -223,6 +223,51 @@ def test_an_older_database_gains_the_column() -> None:
         print("OK   a database from the previous schema migrates instead of breaking")
 
 
+def test_recall_is_utf8_whatever_the_console_thinks() -> None:
+    """What the SessionStart hook prints has to survive being read back.
+
+    This is checked in a subprocess because that is the only place the bug
+    exists: inside the test runner stdout is already whatever the runner set,
+    while the hook gets a fresh process whose stdout Windows opens in the ANSI
+    codepage. There "configuración" was written as single cp1252 bytes — not
+    valid UTF-8 at all — so every accented memory reached the model corrupted,
+    and nothing in the pipeline so much as warned.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = str(Path(tmp) / "accents.db")
+
+        from ctxdb import db, store
+
+        conn = db.connect(path)
+        store.get_or_create_collection(conn, "acentos", embed_spec="none")
+        store.set_fact(
+            conn,
+            "acentos",
+            "La configuración de diseño está en el módulo de facturación.",
+            key="doc.config",
+        )
+        conn.close()
+
+        result = subprocess.run(
+            [sys.executable, "-m", "ctxdb.cli", "--db", path, "recall", "acentos", "--policy"],
+            capture_output=True,  # bytes on purpose: decoding here would hide it
+            env={**os.environ, "CTXDB_PATH": path},
+        )
+        assert result.returncode == 0, result.stderr
+
+        try:
+            text = result.stdout.decode("utf-8")
+        except UnicodeDecodeError as err:  # pragma: no cover - the regression
+            raise AssertionError(
+                f"recall emitted bytes that are not UTF-8 ({err}). The hook feeds this "
+                "straight to the model, so an accented memory would arrive corrupted."
+            ) from err
+
+        assert "configuración de diseño" in text, "the accents did not survive the round trip"
+        assert "está en el módulo" in text, text[:200]
+        print("OK   recall prints UTF-8 even where the console would not")
+
+
 def test_an_older_index_is_rebuilt() -> None:
     """A database whose lexical index predates stemming must be rebuilt on open.
 
@@ -285,5 +330,6 @@ if __name__ == "__main__":
     test_two_agents_write_at_the_same_time()
     test_the_writing_agent_is_recorded()
     test_an_older_database_gains_the_column()
+    test_recall_is_utf8_whatever_the_console_thinks()
     test_an_older_index_is_rebuilt()
     print("\nConcurrency all green.")
