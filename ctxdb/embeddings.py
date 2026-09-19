@@ -62,7 +62,13 @@ class LocalEmbedder:
             ) from exc
         self.spec = f"local:{model_name}"
         self._model = SentenceTransformer(model_name)
-        self.dim = int(self._model.get_sentence_embedding_dimension())
+        # Renamed in sentence-transformers 5; the old spelling still works but warns
+        # on every load, and this runs inside an MCP server whose stderr the user
+        # reads when something is actually wrong.
+        dimension = getattr(self._model, "get_embedding_dimension", None) or (
+            self._model.get_sentence_embedding_dimension
+        )
+        self.dim = int(dimension())
         # E5 models were trained with these prefixes; omitting them degrades
         # retrieval noticeably.
         self._e5 = "e5" in model_name.lower()

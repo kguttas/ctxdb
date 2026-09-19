@@ -107,6 +107,38 @@ def main() -> None:
         "the stale schedule is no longer retrieved through the semantic path",
     )
 
+    # --- reindexing onto another engine ----------------------------------
+    # The escape hatch the per-collection pinning implies: a collection that
+    # started on BM25 alone has to be able to gain vectors over material already
+    # stored, without re-ingesting any of it by hand.
+    get_or_create_collection(conn, "late", embed_spec="none")
+    set_fact(conn, "late", "Backups are encrypted in cold storage.", key="late.backups")
+    store.add_document(conn, "late", "# Ops\n\nThe cluster is orchestrated by Kubernetes.\n",
+                       uri="late.md", title="Late")
+    check(not search(conn, "late", "kubernetes orchestrated")["branches"].get("vector"),
+          "a collection with no engine has no semantic branch")
+
+    outcome = store.reindex_collection(conn, "late", "toy:64")
+    check(outcome["embed_dim"] == DIM, "reindexing pins the new dimension on the collection")
+    check(outcome["vectors"] == 2, f"every stored item is re-embedded ({outcome['vectors']})")
+
+    indexed = conn.execute(
+        "SELECT COUNT(*) AS n FROM items i JOIN collections c ON c.id = i.collection_id"
+        " WHERE c.name = 'late' AND i.embed_model IS NULL"
+    ).fetchone()["n"]
+    check(indexed == 0, "no item is left without a record of what indexed it")
+    check(bool(search(conn, "late", "encrypted cold storage")["branches"].get("vector")),
+          "the semantic branch answers over material stored before the switch")
+
+    # Going back to no engine has to clean up after itself, or the old vectors
+    # would sit in the table unreachable and still be returned by a raw KNN.
+    store.reindex_collection(conn, "late", "none")
+    orphans = conn.execute(
+        "SELECT COUNT(*) AS n FROM items i JOIN collections c ON c.id = i.collection_id"
+        " WHERE c.name = 'late' AND i.embed_model IS NOT NULL"
+    ).fetchone()["n"]
+    check(orphans == 0, "reindexing back to none leaves no vectors behind")
+
     print(f"\nVector branch all green. Test database: {tmp}")
 
 

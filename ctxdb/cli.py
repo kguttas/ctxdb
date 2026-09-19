@@ -37,6 +37,10 @@ def main(argv: list[str] | None = None) -> int:
     p_new.add_argument("--description", default=None)
     col_sub.add_parser("list")
 
+    p_re = col_sub.add_parser("reindex", help="switch embedding engine and rebuild vectors")
+    p_re.add_argument("name")
+    p_re.add_argument("--embeddings", required=True, help="none | local | voyage | <spec>")
+
     p_ing = sub.add_parser("ingest", help="index a file or a directory")
     p_ing.add_argument("collection")
     p_ing.add_argument("path")
@@ -69,6 +73,22 @@ def main(argv: list[str] | None = None) -> int:
     p_ent.add_argument("collection")
     p_ent.add_argument("name")
 
+    p_recall = sub.add_parser(
+        "recall", help="print this project's stored memory (used by the SessionStart hook)"
+    )
+    p_recall.add_argument(
+        "collection",
+        nargs="?",
+        default=None,
+        help="defaults to the project derived from the working directory",
+    )
+    p_recall.add_argument("--tokens", type=int, default=800, help="ceiling on what is printed")
+    p_recall.add_argument(
+        "--hook",
+        action="store_true",
+        help="emit the JSON envelope a Claude Code SessionStart hook expects",
+    )
+
     sub.add_parser("status", help="inventory of the store")
     sub.add_parser("serve", help="start the MCP server (stdio)")
 
@@ -86,6 +106,11 @@ def main(argv: list[str] | None = None) -> int:
         spec = ALIAS.get(args.embeddings, args.embeddings)
         row = store.get_or_create_collection(conn, args.name, spec, args.description)
         _out({k: row[k] for k in row.keys()})
+
+    elif args.cmd == "collection" and args.sub == "reindex":
+        spec = ALIAS.get(args.embeddings, args.embeddings)
+        print(f"reindexing {args.name!r} to {spec} ...", file=sys.stderr)
+        _out(store.reindex_collection(conn, args.name, spec))
 
     elif args.cmd == "collection":
         _out(store.list_collections(conn))
@@ -133,8 +158,33 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "entity":
         _out(retrieve.recall_entity(conn, args.collection, args.name))
 
+    elif args.cmd == "recall":
+        project = args.collection or db.project_collection()
+        result = retrieve.recall_recent(
+            conn, [project, db.GLOBAL_COLLECTION], budget_tokens=args.tokens
+        )
+        block = retrieve.render_recall(result, project)
+        if args.hook:
+            # A hook that prints nothing adds nothing, which is the right behaviour
+            # for an empty store: the first session in a new project should not be
+            # charged for a block that says there is no memory yet.
+            if block:
+                _out(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": block,
+                        }
+                    }
+                )
+        else:
+            print(block or f"(nothing stored yet for {project!r})")
+
     elif args.cmd == "status":
-        _out(store.stats(conn))
+        payload = store.stats(conn)
+        payload["project_collection"] = db.project_collection()
+        payload["global_collection"] = db.GLOBAL_COLLECTION
+        _out(payload)
 
     return 0
 

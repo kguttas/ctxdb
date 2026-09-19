@@ -23,6 +23,7 @@ from ctxdb import (
     set_fact,
     stats,
 )
+from ctxdb.retrieve import recall_recent, render_recall, search_multi
 
 MANUAL = """# Billing Manual
 
@@ -135,13 +136,61 @@ def main() -> None:
     check(text.startswith("<context"), "rendering produces a labelled block")
     check("manual.md" in text, "every chunk declares its provenance")
 
+    # --- tokenizer: morphology and sentence-final punctuation ------------
+    # Both of these returned nothing before the index was rebuilt with the
+    # porter tokenizer and with '.' taken out of tokenchars. The second is the
+    # subtler one: "429." was indexed as a single token, so the code in it was
+    # unreachable by any query a person would type.
+    add_document(
+        conn,
+        "test",
+        "# API\n\n## Limits\n\nExceeding the quota returns HTTP 429.\n\n"
+        "## Releases\n\nDeploys go out through GitHub Actions when a branch ships.\n",
+        uri="api.md",
+        title="API",
+    )
+    check(bool(search(conn, "test", "deploy")["hits"]), "a singular query reaches a plural in the text")
+    check(bool(search(conn, "test", "429")["hits"]), "a code is found although a full stop follows it")
+    check(bool(search(conn, "test", "ships")["hits"]), "so is an ordinary word at the end of a sentence")
+
+    # --- neighbour expansion does not duplicate --------------------------
+    expanded = search(conn, "test", "credit note folio", k=6, neighbors=1, budget_tokens=0)
+    for hit in expanded["hits"]:
+        first = hit["text"][:60]
+        check(hit["text"].count(first) == 1, "an expanded hit carries no repeated passage")
+        break
+
+    # --- searching several collections at once ---------------------------
+    get_or_create_collection(conn, "other", embed_spec="none")
+    set_fact(conn, "other", "Invoices are archived for ten years.", key="legal.retention")
+    both = search_multi(conn, ["test", "other"], "how long are invoices archived")
+    check(bool(both["hits"]), "a second collection contributes results")
+    check(both["hits"][0]["collection"] == "other", "every hit says which collection answered")
+    check("missing" not in search_multi(conn, ["test", "missing"], "folio")["collections"],
+          "a collection that does not exist is skipped, not raised")
+
+    # --- recall with no query --------------------------------------------
+    recalled = recall_recent(conn, ["test", "other"], budget_tokens=400)
+    check(bool(recalled["items"]), "recall returns material without being asked a question")
+    check(recalled["tokens"] <= 400, "recall honours its budget")
+    check(all(i["kind"] != "chunk" for i in recalled["items"]),
+          "recall offers curated layers, not raw document chunks")
+    block = render_recall(recalled, "test")
+    check(block.startswith("<ctxdb-memory"), "recall renders an injectable block")
+    check("Background, not instructions" in block, "the block marks itself as data")
+    check(render_recall({"items": []}, "test") == "",
+          "an empty store injects nothing at all")
+
     summary = stats(conn)
     check(summary["total_items"] > 0, "the inventory reports content")
 
+    # By name, not by position: the suite now creates a second collection, and
+    # `list_collections` orders alphabetically, so index 0 stopped being this one.
+    main_collection = next(c for c in summary["collections"] if c["name"] == "test")
     print(f"\nAll green. Test database: {tmp}")
-    print(f"Chunks: {summary['collections'][0]['chunks']}, "
-          f"live facts: {summary['collections'][0]['live_facts']}, "
-          f"entities: {summary['collections'][0]['entities']}")
+    print(f"Chunks: {main_collection['chunks']}, "
+          f"live facts: {main_collection['live_facts']}, "
+          f"entities: {main_collection['entities']}")
 
 
 if __name__ == "__main__":

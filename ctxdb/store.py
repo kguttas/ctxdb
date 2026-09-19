@@ -44,6 +44,72 @@ def get_or_create_collection(
     return conn.execute("SELECT * FROM collections WHERE name = ?", (name,)).fetchone()
 
 
+def reindex_collection(
+    conn: sqlite3.Connection,
+    collection_name: str,
+    embed_spec: str,
+    batch: int = 64,
+) -> dict[str, Any]:
+    """Switch a collection to another embedding engine and rebuild its vectors.
+
+    The escape hatch the pinning implies. `embed_spec` is fixed at creation because
+    vectors from two models are not comparable, which is correct — but without a way
+    to rebuild them, a collection started on BM25 alone could never gain semantic
+    search over the material already in it, and the only remedy would be to re-ingest
+    everything by hand.
+
+    Old vectors are dropped by their *old* dimension before the collection row moves
+    to the new one; reading the dimension afterwards would look for the vectors in a
+    table that never held them and leave the originals orphaned in place.
+
+    Batched, and each batch is embedded before its transaction opens, for the same
+    reason everything else here is: the write lock is shared with whatever agents are
+    working meanwhile, and a reindex is the longest job this store ever runs.
+    """
+    collection = require_collection(conn, collection_name)
+    embedder = get_embedder(embed_spec)
+
+    rows = conn.execute(
+        "SELECT id, kind, title, text FROM items WHERE collection_id = ? ORDER BY id",
+        (collection["id"],),
+    ).fetchall()
+
+    _drop_vectors(conn, collection["embed_dim"], [r["id"] for r in rows])
+    conn.execute(
+        "UPDATE collections SET embed_spec = ?, embed_dim = ? WHERE id = ?",
+        (embedder.spec, embedder.dim, collection["id"]),
+    )
+    conn.execute(
+        "UPDATE items SET embed_model = NULL WHERE collection_id = ?", (collection["id"],)
+    )
+    conn.commit()
+
+    if embedder.dim <= 0:
+        return {"collection": collection_name, "embed_spec": embedder.spec, "vectors": 0}
+
+    done = 0
+    for start in range(0, len(rows), batch):
+        window = rows[start : start + batch]
+        vectors = embedder.embed(
+            [embed_payload(r["kind"], r["title"], r["text"]) for r in window],
+            mode="document",
+        )
+        _store_vectors(
+            conn,
+            [r["id"] for r in window],
+            Embedded(embedder.spec, embedder.dim, vectors),
+        )
+        conn.commit()
+        done += len(window)
+
+    return {
+        "collection": collection_name,
+        "embed_spec": embedder.spec,
+        "embed_dim": embedder.dim,
+        "vectors": done,
+    }
+
+
 def require_collection(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM collections WHERE name = ?", (name,)).fetchone()
     if row is None:
@@ -79,6 +145,20 @@ class Embedded(NamedTuple):
     spec: str
     dim: int
     vectors: list[list[float]]
+
+
+def embed_payload(kind: str, title: str | None, text: str) -> str:
+    """The exact text that gets embedded for an item.
+
+    In one place because it has to be identical at write time and at reindex time.
+    Embedding a chunk with its heading path but reindexing it without would move
+    every vector slightly, and the damage would be invisible: no error, just
+    retrieval quietly getting worse for the items that were rebuilt.
+    """
+    if kind == "fact":
+        # A fact's title is its subject, which reads as part of the sentence.
+        return f"{title or ''} {text}".strip()
+    return f"{title or ''}\n{text}".strip()
 
 
 def embed_ahead(collection: sqlite3.Row, texts: list[str]) -> Embedded | None:
@@ -183,12 +263,32 @@ def add_document(
     # only for the inserts. See `embed_ahead`: this is what lets a second agent keep
     # working while this one ingests a manual.
     chunks = chunk_text(text, target_tokens=target_tokens)
+
+    # Headings are resolved before embedding, not inside the insert loop, so the
+    # vector sees the same heading path the item will be stored with — document
+    # title included. A chunk is indexed together with that path, which is how a
+    # query about "credit notes" reaches a paragraph that never says the words but
+    # hangs under that section.
+    headings: list[str | None] = []
+    for chunk in chunks:
+        parts = chunk.heading_path.split(" > ") if chunk.heading_path else []
+        # Skip the document title when the document already opens with an
+        # equivalent heading, to avoid repeating it.
+        if title and (not parts or normalize(parts[0]) != normalize(title)):
+            parts.insert(0, title)
+        headings.append(" > ".join(p for p in parts if p) or None)
+
     embedded = embed_ahead(
-        collection, [f"{c.heading_path}\n{c.text}".strip() for c in chunks]
+        collection,
+        [embed_payload("chunk", h, c.text) for h, c in zip(headings, chunks)],
     )
 
     if existing:
-        delete_source(conn, collection_name, uri=uri)
+        # Deliberately the internal form, which does not commit: the delete and the
+        # re-insert have to land in one transaction. Committing between them left a
+        # window where a failure on the way in had already destroyed the version on
+        # disk — re-ingesting a file would lose the document rather than replace it.
+        _delete_source_rows(conn, collection, existing)
 
     cur = conn.execute(
         "INSERT INTO sources (collection_id, uri, title, kind, content_hash, meta, created_at)"
@@ -198,16 +298,7 @@ def add_document(
     source_id = int(cur.lastrowid)
 
     item_ids: list[int] = []
-    for chunk in chunks:
-        # A chunk is indexed together with its heading path, so a query about
-        # "credit notes" can reach a paragraph that never says those words but
-        # hangs under that section. The title is skipped when the document
-        # already opens with an equivalent heading, to avoid repeating it.
-        parts = chunk.heading_path.split(" > ") if chunk.heading_path else []
-        if title and (not parts or normalize(parts[0]) != normalize(title)):
-            parts.insert(0, title)
-        heading = " > ".join(p for p in parts if p)
-
+    for heading, chunk in zip(headings, chunks):
         cur = conn.execute(
             "INSERT INTO items (collection_id, kind, text, title, source_id, ord, meta,"
             " token_estimate, client, created_at, updated_at)"
@@ -215,7 +306,7 @@ def add_document(
             (
                 collection["id"],
                 chunk.text,
-                heading or None,
+                heading,
                 source_id,
                 chunk.ord,
                 json.dumps(meta or {}),
@@ -231,10 +322,30 @@ def add_document(
 
     for item_id in item_ids:
         _attach_entities(conn, collection, item_id, entities)
-        autolink_entities(conn, collection, item_id)
+    # After _attach_entities, so names declared on this call are already in the
+    # table and get matched in the other chunks too.
+    matcher = build_entity_matcher(conn, collection)
+    for item_id in item_ids:
+        autolink_entities(conn, collection, item_id, matcher)
 
     conn.commit()
     return {"source_id": source_id, "chunks": len(item_ids), "status": "indexed"}
+
+
+def _delete_source_rows(
+    conn: sqlite3.Connection, collection: sqlite3.Row, source: sqlite3.Row
+) -> int:
+    """Drop a document's rows and vectors without committing.
+
+    The caller owns the transaction, which is what lets `add_document` replace a
+    document atomically instead of destroying it first and hoping.
+    """
+    ids = [
+        r["id"] for r in conn.execute("SELECT id FROM items WHERE source_id = ?", (source["id"],))
+    ]
+    _drop_vectors(conn, collection["embed_dim"], ids)
+    conn.execute("DELETE FROM sources WHERE id = ?", (source["id"],))
+    return len(ids)
 
 
 def delete_source(conn: sqlite3.Connection, collection_name: str, uri: str) -> int:
@@ -245,13 +356,9 @@ def delete_source(conn: sqlite3.Connection, collection_name: str, uri: str) -> i
     ).fetchone()
     if source is None:
         return 0
-    ids = [
-        r["id"] for r in conn.execute("SELECT id FROM items WHERE source_id = ?", (source["id"],))
-    ]
-    _drop_vectors(conn, collection["embed_dim"], ids)
-    conn.execute("DELETE FROM sources WHERE id = ?", (source["id"],))
+    n = _delete_source_rows(conn, collection, source)
     conn.commit()
-    return len(ids)
+    return n
 
 
 # --------------------------------------------------------------------------
@@ -290,7 +397,7 @@ def set_fact(
             return {"item_id": previous["id"], "status": "unchanged"}
 
     # After ruling out the unchanged case, and before writing anything.
-    embedded = embed_ahead(collection, [f"{subject or ''} {statement}".strip()])
+    embedded = embed_ahead(collection, [embed_payload("fact", subject, statement)])
 
     if previous:
         # Free the live-fact unique index by pointing the old row at itself;
@@ -354,7 +461,7 @@ def add_note(
     bodies = [c.text for c in pieces] if pieces else [text]
 
     # Before the first insert, so the lock is not held while the model runs.
-    embedded = embed_ahead(collection, [f"{title or ''}\n{b}".strip() for b in bodies])
+    embedded = embed_ahead(collection, [embed_payload("note", title, b) for b in bodies])
 
     item_ids: list[int] = []
     for chunk in pieces or [None]:
@@ -380,7 +487,9 @@ def add_note(
     _store_vectors(conn, item_ids, embedded)
     for item_id in item_ids:
         _attach_entities(conn, collection, item_id, entities)
-        autolink_entities(conn, collection, item_id)
+    matcher = build_entity_matcher(conn, collection)
+    for item_id in item_ids:
+        autolink_entities(conn, collection, item_id, matcher)
 
     conn.commit()
     return {"item_ids": item_ids, "chunks": len(item_ids)}
@@ -489,7 +598,41 @@ def _attach_entities(
         )
 
 
-def autolink_entities(conn: sqlite3.Connection, collection: sqlite3.Row, item_id: int) -> int:
+class EntityMatcher(NamedTuple):
+    """One compiled alternation covering every known entity name.
+
+    Built once per write and reused for every item it produces. The previous
+    version re-read the entity table and ran one regex *per entity per item*,
+    all of it inside the write transaction: ingesting a 200-chunk manual into a
+    collection with 500 entities meant 100k regex passes with the write lock
+    held. That is exactly the cost `embed_ahead` was written to move out of the
+    lock, quietly reintroduced one layer down. One alternation makes it a single
+    pass per item, and the scan stops depending on how big the graph has grown.
+    """
+
+    pattern: re.Pattern[str] | None
+    ids: dict[str, int]
+
+
+def build_entity_matcher(conn: sqlite3.Connection, collection: sqlite3.Row) -> EntityMatcher:
+    rows = conn.execute(
+        "SELECT id, norm_name FROM entities WHERE collection_id = ?", (collection["id"],)
+    ).fetchall()
+    ids = {r["norm_name"]: int(r["id"]) for r in rows if len(r["norm_name"]) >= 3}
+    if not ids:
+        return EntityMatcher(None, {})
+    # Longest first, so "acme corp" wins over "acme" where both are declared.
+    names = sorted(ids, key=len, reverse=True)
+    alternation = "|".join(re.escape(n) for n in names)
+    return EntityMatcher(re.compile(rf"(?<!\w)({alternation})(?!\w)"), ids)
+
+
+def autolink_entities(
+    conn: sqlite3.Connection,
+    collection: sqlite3.Row,
+    item_id: int,
+    matcher: EntityMatcher | None = None,
+) -> int:
     """Link the item to the *already known* entities it mentions.
 
     It deliberately does not extract new entities: guessing them with heuristics
@@ -499,20 +642,20 @@ def autolink_entities(conn: sqlite3.Connection, collection: sqlite3.Row, item_id
     row = conn.execute("SELECT text, title FROM items WHERE id = ?", (item_id,)).fetchone()
     if row is None:
         return 0
+
+    matcher = matcher or build_entity_matcher(conn, collection)
+    if matcher.pattern is None:
+        return 0
+
     haystack = normalize(f"{row['title'] or ''} {row['text']}")
+    found = {m.group(1) for m in matcher.pattern.finditer(haystack)}
     linked = 0
-    for entity in conn.execute(
-        "SELECT id, norm_name FROM entities WHERE collection_id = ?", (collection["id"],)
-    ).fetchall():
-        name = entity["norm_name"]
-        if len(name) < 3:
-            continue
-        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", haystack):
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO item_entities (item_id, entity_id) VALUES (?, ?)",
-                (item_id, entity["id"]),
-            )
-            linked += cur.rowcount or 0
+    for name in found:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO item_entities (item_id, entity_id) VALUES (?, ?)",
+            (item_id, matcher.ids[name]),
+        )
+        linked += cur.rowcount or 0
     return linked
 
 
