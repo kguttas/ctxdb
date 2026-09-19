@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .schema import DDL, SCHEMA_VERSION, VEC_TABLE_DDL
+from .schema import DDL, FTS_DDL, SCHEMA_VERSION, VEC_TABLE_DDL
 
 DEFAULT_DB_PATH = Path(os.environ.get("CTXDB_PATH", Path.home() / ".ctxdb" / "context.db"))
 
@@ -27,6 +28,37 @@ DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("CTXDB_BUSY_TIMEOUT", "20000"))
 # comes next — and once they share it, "who wrote this" stops being a curiosity: it
 # is how you audit a wrong answer back to the session that planted it.
 CLIENT = os.environ.get("CTXDB_CLIENT", "unknown")
+
+# Memory that holds everywhere, kept apart from any one project: how the user likes
+# answers written, which tools they reach for, decisions that outlive a repository.
+# A preference should not have to be restated in every checkout, and a detail about
+# one repository has no business following you into the others.
+GLOBAL_COLLECTION = os.environ.get("CTXDB_GLOBAL", "global")
+
+
+def slug(name: str) -> str:
+    """A collection name from a directory name: lowercase, ascii-ish, no spaces."""
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", name.strip().lower()).strip("-.")
+    return cleaned or "default"
+
+
+def project_collection() -> str:
+    """Which collection this session's memory belongs in.
+
+    Resolved on every call rather than pinned at startup, because one server process
+    can outlive the directory it was launched in and the wrong answer here is not a
+    crash — it is memory filed silently under another project, found later by nobody.
+
+    In order: an explicit `CTXDB_COLLECTION` wins, because whoever set it meant it.
+    Otherwise the host's own idea of the project root, which Claude Code exports as
+    CLAUDE_PROJECT_DIR. Otherwise the working directory, which for a stdio MCP server
+    and for a hook alike is the session's directory.
+    """
+    explicit = os.environ.get("CTXDB_COLLECTION")
+    if explicit:
+        return explicit
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    return slug(Path(root).name)
 
 
 def now() -> str:
@@ -108,6 +140,50 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_items_client ON items(collection_id, client)"
     )
+
+    _migrate_fts(conn)
+
+
+def _fts_signature(sql: str) -> tuple[str, ...]:
+    """The parts of an FTS5 declaration that cannot be changed after creation.
+
+    Comparing these rather than a schema version number is what makes the rebuild
+    self-correcting: any file whose index does not match the current declaration is
+    rebuilt, whatever version it claims to be, including one left behind by a
+    half-finished upgrade.
+    """
+    return tuple(
+        re.sub(r"\s+", " ", m.group(0))
+        for pattern in (r"tokenize\s*=\s*\"[^\"]*\"", r"prefix\s*=\s*'[^']*'")
+        for m in re.finditer(pattern, sql)
+    )
+
+
+def _migrate_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild the lexical index when it was built with an older tokenizer.
+
+    A tokenizer is fixed at CREATE time: an existing `items_fts` keeps indexing the
+    way it always did, and `CREATE ... IF NOT EXISTS` in the DDL silently leaves it
+    alone. So a database built before stemming would keep missing "deploy" against
+    "deploys" forever, with nothing to show why.
+
+    The check reads the tokenizer out of the stored DDL rather than a version number,
+    which makes it self-correcting: any file whose index does not match the current
+    declaration gets rebuilt, whatever version it claims to be. Dropping the table
+    does not drop the triggers that feed it — they bind by name and keep working
+    against the new one — and `rebuild` re-indexes from `items`, the content table,
+    so nothing has to be re-ingested.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'items_fts'"
+    ).fetchone()
+    if row is not None and _fts_signature(row["sql"] or "") == _fts_signature(FTS_DDL):
+        return
+
+    conn.execute("DROP TABLE IF EXISTS items_fts")
+    conn.executescript(FTS_DDL)
+    conn.execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')")
+    conn.commit()
 
 
 def _load_sqlite_vec(conn: sqlite3.Connection) -> bool:

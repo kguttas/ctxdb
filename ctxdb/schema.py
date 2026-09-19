@@ -26,7 +26,37 @@ bring an older database forward. A new column here only ever reaches a fresh fil
 `CREATE TABLE IF NOT EXISTS` does nothing to one that already exists.
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# Kept apart from the rest of the DDL because a tokenizer change cannot be applied
+# in place: the index has to be dropped and rebuilt. `db._migrate_fts` re-runs this
+# block on its own when it finds an index built with the old tokenizer.
+#
+# `porter` wraps unicode61 and stems before indexing, which is what makes a query
+# for "deploy" reach a passage that says "deploys". Without it FTS5 matches whole
+# tokens only, and ordinary morphology — a plural, a conjugation — misses outright.
+# The stemmer is English, but its first step strips the trailing -s, so Spanish
+# plurals ("respuestas" -> "respuesta") come along for free.
+#
+# remove_diacritics=2 makes "diseño" match "diseno", so accented languages behave
+# the way users actually type.
+#
+# tokenchars is '-_' and deliberately NOT '.': a period is a token character
+# everywhere or nowhere, and "everywhere" means the full stop ending a sentence
+# glues itself to the last word. Indexing "returns HTTP 429." stored the token
+# "429." — so a search for `429` found nothing, and neither did `ships` in
+# "...ships.". Dropping the period costs nothing, because `db.host` then splits
+# into `db` + `host` on both sides of the search and the phrase still matches.
+FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+    text,
+    title,
+    content='items',
+    content_rowid='id',
+    prefix='2 3 4',
+    tokenize="porter unicode61 remove_diacritics 2 tokenchars '-_'"
+);
+"""
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -125,15 +155,8 @@ CREATE TABLE IF NOT EXISTS item_entities (
 
 CREATE INDEX IF NOT EXISTS idx_item_entities_entity ON item_entities(entity_id);
 
--- Lexical index. remove_diacritics=2 makes "diseño" match "diseno", so accented
--- languages behave the way users actually type.
-CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
-    text,
-    title,
-    content='items',
-    content_rowid='id',
-    tokenize="unicode61 remove_diacritics 2 tokenchars '-_.'"
-);
+-- The lexical index itself is declared in FTS_DDL, above, and spliced in here.
+__FTS_DDL__
 
 CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
     INSERT INTO items_fts(rowid, text, title) VALUES (new.id, new.text, new.title);
@@ -150,6 +173,8 @@ CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF text, title ON items BEGIN
     INSERT INTO items_fts(rowid, text, title) VALUES (new.id, new.text, new.title);
 END;
 """
+
+DDL = DDL.replace("__FTS_DDL__", FTS_DDL)
 
 # Vector tables are created on demand: one per embedding dimension.
 VEC_TABLE_DDL = """

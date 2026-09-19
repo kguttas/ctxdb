@@ -223,6 +223,60 @@ def test_an_older_database_gains_the_column() -> None:
         print("OK   a database from the previous schema migrates instead of breaking")
 
 
+def test_an_older_index_is_rebuilt() -> None:
+    """A database whose lexical index predates stemming must be rebuilt on open.
+
+    The failure this guards against is the quiet kind: a tokenizer is fixed at
+    CREATE time and `CREATE ... IF NOT EXISTS` leaves an existing index alone, so
+    without the rebuild an upgraded install keeps searching the old way forever,
+    with nothing in the output to say why its results got worse than a fresh
+    database's.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = str(Path(tmp) / "stale.db")
+
+        from ctxdb import db, retrieve, store
+
+        conn = db.connect(path)
+        store.get_or_create_collection(conn, "shared", embed_spec="none")
+        store.add_note(conn, "shared", "Deploys go out on merge. Exceeding it returns HTTP 429.")
+
+        # Put the index back the way it shipped before: no stemmer, and '.' as a
+        # token character, which glued the full stop onto the preceding word.
+        conn.execute("DROP TABLE items_fts")
+        conn.executescript(
+            "CREATE VIRTUAL TABLE items_fts USING fts5(text, title, content='items',"
+            " content_rowid='id',"
+            " tokenize=\"unicode61 remove_diacritics 2 tokenchars '-_.'\");"
+        )
+        conn.execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')")
+        conn.commit()
+
+        stale = {q: len(retrieve.search(conn, "shared", q)["hits"]) for q in ("429", "merge")}
+        assert stale["429"] == 0, f"the old index was expected to miss a trailing code: {stale}"
+        conn.close()
+
+        conn = db.connect(path)
+        fresh = {q: len(retrieve.search(conn, "shared", q)["hits"]) for q in ("429", "merge")}
+        assert fresh["429"] == 1, f"the rebuilt index must find it: {fresh}"
+        assert fresh["merge"] == 1, "and must not have lost what already worked"
+
+        n = conn.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"]
+        assert n == 1, "rebuilding the index must not touch the items themselves"
+
+        # Opening again must leave it alone rather than rebuild on every connect.
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'items_fts'"
+        ).fetchone()["sql"]
+        conn.close()
+        conn = db.connect(path)
+        assert conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'items_fts'"
+        ).fetchone()["sql"] == sql, "a current index is left untouched"
+        conn.close()
+        print("OK   a database with an outdated lexical index is rebuilt on open")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:  # running as one of the child agents
         {"ingester": role_ingester, "writer": role_writer}[sys.argv[1]](sys.argv[2])
@@ -231,4 +285,5 @@ if __name__ == "__main__":
     test_two_agents_write_at_the_same_time()
     test_the_writing_agent_is_recorded()
     test_an_older_database_gains_the_column()
+    test_an_older_index_is_rebuilt()
     print("\nConcurrency all green.")
