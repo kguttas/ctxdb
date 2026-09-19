@@ -1,0 +1,11 @@
+{
+  "name": "ctxdb",
+  "description": "Persistent memory for Claude Code. Stores context as structure — facts that supersede, document chunks that keep their heading path, notes — and retrieves it with hybrid lexical+semantic search, scoped per project. Recall is injected at session start rather than left to the model to remember to ask for.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Mauricio Estrada Celis"
+  },
+  "homepage": "https://github.com/kguttas/ctxdb",
+  "license": "MIT",
+  "keywords": ["memory", "context", "rag", "retrieval", "sqlite", "embeddings"]
+}

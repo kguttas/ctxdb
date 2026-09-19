@@ -37,24 +37,41 @@ uv venv --python 3.12
 uv pip install -e .
 ```
 
-Connect it to Claude Code:
+Install it as a plugin, which brings the server, the recall hook and the
+commands in one piece:
+
+```
+/plugin marketplace add kguttas/ctxdb
+/plugin install ctxdb@ctxdb
+/ctxdb:setup
+```
+
+`/ctxdb:setup` is a separate step on purpose: it downloads a few hundred
+megabytes for local embeddings, and a session-start hook has no business doing
+that behind your back. Pass `no-embeddings` to skip it and run on BM25 alone.
+
+Restart afterwards — the MCP server and the hook are both read at launch.
+
+<details>
+<summary>Wiring it by hand instead</summary>
 
 ```bash
 claude mcp add ctxdb -s user \
   -e CTXDB_CLIENT=claude \
   -e CTXDB_EMBED=local:intfloat/multilingual-e5-small \
-  -- /absolute/path/to/ctxdb/.venv/bin/python -m ctxdb.server
+  -- uv run --no-sync --project /absolute/path/to/ctxdb ctxdb-mcp
 ```
 
-Point it at the interpreter rather than at `uv run --directory`: that flag changes
-the working directory, and the working directory is what tells the server which
-project it is remembering for. `CTXDB_CLIENT` stamps every item with the agent
-that wrote it — it costs nothing now and is the only thing that tells sessions
-apart later.
+Two flags carry weight here. `--no-sync` is not an optimisation: a plain
+`uv run` re-syncs the environment on every invocation, and on Windows that
+collides with the DLLs the running server holds open — which corrupts the
+environment it is trying to prepare. And `--project` rather than `--directory`,
+because `--directory` changes the working directory, and the working directory
+is what tells the server which project it is remembering for.
 
-That gives Claude nine tools. **It does not yet give it a memory**, and the
-difference is the whole of [Making it actually fire](#making-it-actually-fire)
-below: tools are only used when something decides to use them.
+Doing it this way means also adding the hook and the policy yourself; see
+[Making it actually fire](#making-it-actually-fire).
+</details>
 
 <details>
 <summary>Claude Desktop instead (<code>claude_desktop_config.json</code>)</summary>
@@ -122,15 +139,21 @@ global collection, capped at a token budget, wrapped in a block that labels itse
 as recalled data rather than instruction. An empty store prints nothing at all, so
 a project with no memory yet pays nothing for the hook. It takes about 200 ms.
 
-**Writing is governed by a policy**, in `~/.claude/CLAUDE.md`, that says what
-clears the bar: a decision *and its reason*, a correction the user made, a
+**Writing is governed by a policy** — `ctxdb/policy.py`, injected by that same
+hook — that says what clears the bar: a decision *and its reason*, a correction the user made, a
 constraint that cost time to find. And what does not: anything git already
 records, the narrative of what was just done, secrets, details that die with the
 conversation. The bar matters more than the prose around it — a store full of
 noise is how retrieval stops being worth reading.
 
-A `PreCompact` hook adds a last reminder to persist what the conversation is about
-to lose, and `/remember` and `/recall` slash commands give a manual override.
+A `PreCompact` hook adds a last reminder to persist what the conversation is
+about to lose, and `/ctxdb:remember` and `/ctxdb:recall` give a manual override.
+
+The policy travels in the package rather than in your `CLAUDE.md` because it has
+to arrive with the plugin. Handing someone the tools and asking them to also
+paste in a policy is asking them to do the one step whose omission is the entire
+failure. If you keep your own copy in a `CLAUDE.md`, run the hook without
+`--policy` so it is not stated twice.
 
 Without this layer the rest of this README describes a very good database that
 nothing writes to.

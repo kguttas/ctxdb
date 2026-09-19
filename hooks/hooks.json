@@ -1,0 +1,28 @@
+{
+  "description": "Hands each session the memory stored for its project, and asks for anything worth keeping before the conversation is compacted away.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "timeout": 15,
+            "statusMessage": "Recalling stored context..."
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreCompact\",\"additionalContext\":\"Before this conversation is compacted: anything decided here that should outlive it belongs in ctxdb now. context_set_fact with a stable key for decisions, preferences and state; context_add_note for an observation worth keeping. Skip what the repository already records. If nothing qualifies, store nothing.\"}}'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "ctxdb": {
+    "command": "uv",
+    "args": ["run", "--no-sync", "--project", "${CLAUDE_PLUGIN_ROOT}", "ctxdb-mcp"],
+    "env": {
+      "CTXDB_CLIENT": "claude",
+      "CTXDB_EMBED": "local:intfloat/multilingual-e5-small"
+    }
+  }
+}

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import db, retrieve, store
 from .embeddings import DEFAULT_LOCAL_MODEL, DEFAULT_VOYAGE_MODEL
+from .policy import MEMORY_POLICY
 
 ALIAS = {"local": f"local:{DEFAULT_LOCAL_MODEL}", "voyage": f"voyage:{DEFAULT_VOYAGE_MODEL}"}
 
@@ -87,6 +88,12 @@ def main(argv: list[str] | None = None) -> int:
         "--hook",
         action="store_true",
         help="emit the JSON envelope a Claude Code SessionStart hook expects",
+    )
+    p_recall.add_argument(
+        "--policy",
+        action="store_true",
+        help="prepend the rule for what is worth remembering (the plugin uses this;"
+        " leave it off if you keep the same policy in your own CLAUDE.md)",
     )
 
     sub.add_parser("status", help="inventory of the store")
@@ -164,10 +171,16 @@ def main(argv: list[str] | None = None) -> int:
             conn, [project, db.GLOBAL_COLLECTION], budget_tokens=args.tokens
         )
         block = retrieve.render_recall(result, project)
+        if args.policy:
+            # The policy goes first: it is what the recalled block is to be read
+            # under. It is emitted even when nothing is stored yet — a session
+            # that knows the rule can start writing, and the first session in a
+            # new project is exactly the one with everything still to record.
+            block = f"{MEMORY_POLICY}\n\n{block}" if block else MEMORY_POLICY
         if args.hook:
             # A hook that prints nothing adds nothing, which is the right behaviour
-            # for an empty store: the first session in a new project should not be
-            # charged for a block that says there is no memory yet.
+            # for an empty store with no policy asked for: the first session in a
+            # new project should not be charged for a block saying it is empty.
             if block:
                 _out(
                     {

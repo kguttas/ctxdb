@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ctxdb",
+  "description": "Persistent, project-scoped memory for coding agents.",
+  "owner": {
+    "name": "Mauricio Estrada Celis",
+    "url": "https://github.com/kguttas"
+  },
+  "plugins": [
+    {
+      "name": "ctxdb",
+      "description": "Persistent memory for Claude Code: facts that supersede, structure-aware document chunks and notes, retrieved by hybrid lexical+semantic search and scoped per project. Recall is injected at session start instead of waiting for the model to think of asking.",
+      "category": "productivity",
+      "source": "./"
+    }
+  ]
+}
