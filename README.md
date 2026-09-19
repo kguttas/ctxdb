@@ -40,16 +40,21 @@ uv pip install -e .
 Connect it to Claude Code:
 
 ```bash
-claude mcp add ctxdb -e CTXDB_CLIENT=claude -- uv --directory /absolute/path/to/ctxdb run ctxdb-mcp
+claude mcp add ctxdb -s user \
+  -e CTXDB_CLIENT=claude \
+  -e CTXDB_EMBED=local:intfloat/multilingual-e5-small \
+  -- /absolute/path/to/ctxdb/.venv/bin/python -m ctxdb.server
 ```
 
-`CTXDB_CLIENT` is what stamps every item with the agent that wrote it; it costs
-nothing now and is the only thing that tells sessions apart later.
+Point it at the interpreter rather than at `uv run --directory`: that flag changes
+the working directory, and the working directory is what tells the server which
+project it is remembering for. `CTXDB_CLIENT` stamps every item with the agent
+that wrote it — it costs nothing now and is the only thing that tells sessions
+apart later.
 
-That's it. Claude now has nine tools; ask it to remember something and then ask
-about it in a later session. No server to run, no Docker, no API key — the
-default setup uses BM25 only, which needs zero extra dependencies and gets you
-surprisingly far.
+That gives Claude nine tools. **It does not yet give it a memory**, and the
+difference is the whole of [Making it actually fire](#making-it-actually-fire)
+below: tools are only used when something decides to use them.
 
 <details>
 <summary>Claude Desktop instead (<code>claude_desktop_config.json</code>)</summary>
@@ -58,16 +63,21 @@ surprisingly far.
 {
   "mcpServers": {
     "ctxdb": {
-      "command": "uv",
-      "args": ["--directory", "/absolute/path/to/ctxdb", "run", "ctxdb-mcp"],
+      "command": "/absolute/path/to/ctxdb/.venv/bin/python",
+      "args": ["-m", "ctxdb.server"],
       "env": {
         "CTXDB_PATH": "/absolute/path/to/context.db",
-        "CTXDB_CLIENT": "claude-desktop"
+        "CTXDB_CLIENT": "claude-desktop",
+        "CTXDB_COLLECTION": "desktop"
       }
     }
   }
 }
 ```
+
+Claude Desktop has no project directory to derive a collection from, so pin one
+with `CTXDB_COLLECTION` rather than letting it land wherever the app happened to
+be launched.
 </details>
 
 Prefer the terminal? Same engine, no Claude required:
@@ -79,6 +89,51 @@ ctxdb search project "which search engine do we use"
 ```
 
 ---
+
+## Making it actually fire
+
+A retrieval system nobody queries stores perfectly and remembers nothing. This is
+the failure mode worth naming, because it looks exactly like success: the server
+connects, the tools appear in the list, and then months pass in which not one
+thing is written or read. A tool description is not a trigger. It is read by a
+model that is already thinking about storing something — which, unprompted, it
+rarely is.
+
+So the triggers live outside the model, in two pieces that do not depend on it
+choosing well:
+
+**Recall happens on its own.** A `SessionStart` hook injects what is already
+stored for this project before the first question is asked:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "timeout": 10,
+                    "command": "/path/to/ctxdb/.venv/bin/python -m ctxdb.cli recall --hook" }] }
+    ]
+  }
+}
+```
+
+`ctxdb recall --hook` prints live facts and notes for the current project plus the
+global collection, capped at a token budget, wrapped in a block that labels itself
+as recalled data rather than instruction. An empty store prints nothing at all, so
+a project with no memory yet pays nothing for the hook. It takes about 200 ms.
+
+**Writing is governed by a policy**, in `~/.claude/CLAUDE.md`, that says what
+clears the bar: a decision *and its reason*, a correction the user made, a
+constraint that cost time to find. And what does not: anything git already
+records, the narrative of what was just done, secrets, details that die with the
+conversation. The bar matters more than the prose around it — a store full of
+noise is how retrieval stops being worth reading.
+
+A `PreCompact` hook adds a last reminder to persist what the conversation is about
+to lose, and `/remember` and `/recall` slash commands give a manual override.
+
+Without this layer the rest of this README describes a very good database that
+nothing writes to.
 
 ## Why it is built this way
 
@@ -119,6 +174,22 @@ ever says *"credit note"*). BM25 handles literals — a SKU, `HTTP 429`, a surna
 sums `1/(k + rank)`: it works on *positions*, not scores, so nothing has to be
 normalized between a cosine distance and a BM25 score, two scales that were
 never comparable.
+
+The lexical half is only as good as its tokenizer, and the settings that look like
+housekeeping decide whether it works at all. FTS5 matches whole tokens, so without
+a stemmer `deploy` never reaches *"deploys"* — the index uses `porter`, whose
+first step also strips the Spanish plural. And a period is a token character
+everywhere or nowhere: with `.` in `tokenchars`, *"returns HTTP 429."* indexed the
+token `429.`, and a search for `429` found nothing. So did `ships` in *"…ships."*
+Neither failure raises anything; both simply return no results, for years.
+
+### Collections follow the project
+
+The collection is derived from the working directory, with a `global` one searched
+alongside it. A preference about how you like answers written belongs everywhere;
+the reason this repository uses Postgres belongs in this repository. Both in one
+collection means each project's memory is diluted by every other project's, and
+`context_search` with no collection named searches the pair.
 
 ### A lightweight graph on top
 
@@ -173,8 +244,9 @@ The limit is 100 requests per minute per token. Exceeding it returns HTTP 429.
 | Variable | Purpose | Default |
 |---|---|---|
 | `CTXDB_PATH` | Path to the `.db` file | `~/.ctxdb/context.db` |
-| `CTXDB_COLLECTION` | Default collection for tool calls | `default` |
-| `CTXDB_EMBED` | Embedding spec for the default collection | `none` |
+| `CTXDB_COLLECTION` | Pin the project collection instead of deriving it from the cwd | — |
+| `CTXDB_GLOBAL` | Name of the cross-project collection | `global` |
+| `CTXDB_EMBED` | Embedding spec for collections created from now on | `none` |
 | `CTXDB_CLIENT` | Name recorded on everything this agent writes | `unknown` |
 | `CTXDB_BUSY_TIMEOUT` | Milliseconds a writer waits for the lock | `20000` |
 | `VOYAGE_API_KEY` | Only if a collection uses `voyage:...` | — |
@@ -222,9 +294,17 @@ a lost write.
 
 Pinned **per collection** at creation time and stored on the collection row, so
 one `.db` file can hold a local collection and an API-backed one side by side.
-Changing it later requires a reindex, because vectors from different models are
-not comparable — which is why they live in tables separated by dimension and
-every item records the model that indexed it.
+Vectors from different models are not comparable, which is why they live in tables
+separated by dimension and every item records the model that indexed it — and why
+switching engines means rebuilding them:
+
+```bash
+ctxdb collection reindex project --embeddings local
+```
+
+That re-embeds everything already stored, in batches, dropping the old vectors by
+their old dimension first. It is how a collection that started on BM25 alone gains
+semantic search over material ingested long before.
 
 | Spec | When to use it | Install |
 |---|---|---|
@@ -260,11 +340,13 @@ print(render_context(result))
 ```bash
 ctxdb collection create project --embeddings local
 ctxdb collection list
+ctxdb collection reindex project --embeddings local   # switch engine, rebuild vectors
 ctxdb ingest project ./docs --pattern "*.md"
 ctxdb fact project "The store is SQLite with sqlite-vec" --key arch.db
 ctxdb relate project "Batch" issued_by "Tax Authority"
 ctxdb search project "which search engine do we use" --neighbors 1
 ctxdb entity project "Tax Authority"
+ctxdb recall                   # what a new session would be handed
 ctxdb status
 ctxdb serve                    # the MCP server over stdio, same as ctxdb-mcp
 ```
@@ -306,10 +388,18 @@ tests/
 
 ### Schema and upgrades
 
-The schema is at **version 2**; the `client` column arrived with it. Upgrading is
+The schema is at **version 3**. Version 2 added the `client` column; version 3
+rebuilt the lexical index with a stemming tokenizer. Upgrading is
 just pulling the new code: `db._migrate` runs on every open, adds what is missing
-and is a no-op once the file is current. Nothing to export, nothing to reindex —
-existing items simply carry a `NULL` client, since nobody recorded one at the time.
+and is a no-op once the file is current. Existing items simply carry a `NULL`
+client, since nobody recorded one at the time.
+
+The index rebuild is decided by comparing the tokenizer in the stored DDL against
+the current declaration, not by a version number, which makes it self-correcting:
+any file whose index does not match gets rebuilt, including one left behind by a
+half-finished upgrade. It re-indexes from `items`, so nothing has to be
+re-ingested — but note it only rebuilds the *lexical* index. Vectors are a
+separate decision, and a deliberate one: `collection reindex`.
 
 ## Known limits
 
@@ -319,6 +409,12 @@ existing items simply carry a `NULL` client, since nobody recorded one at the ti
   well into the tens of thousands of chunks.
 - `context_search` does not rewrite the query. For very indirect questions, run
   two searches with different phrasings.
+- Deciding *what* is worth storing is still the model's judgement. The hooks
+  guarantee that memory is read and that the question gets asked at the right
+  moment; nothing guarantees a good answer to it. Expect to prune.
+- The collection is the working directory's name, so two checkouts of the same
+  repository share a memory and two different projects with the same folder name
+  collide. Pin `CTXDB_COLLECTION` per project where that matters.
 - Single-writer, like SQLite itself. Several agents share one file comfortably
   ([above](#several-agents-on-one-database)), but this is not built for a
   multi-tenant *server* write load.
